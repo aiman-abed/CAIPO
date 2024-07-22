@@ -1,0 +1,245 @@
+Code (in C):
+#include <stdio.h>
+#include <string.h>
+#include "driver/sdmmc_default_configs.h"
+#include "driver/sdmmc_host.h"
+#include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_camera.h"
+#include "driver/i2s.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "esp_spiffs.h"
+#include "sdmmc_cmd.h"
+#include "esp_netif.h"
+#include "esp_heap_caps.h"
+#include <sys/stat.h> // Include this header for mkdir
+#define AUDIO_BUFFER_SIZE 1024
+#define VIDEO_BUFFER_SIZE 1024
+#define NUM_BUFFERS 8
+uint8_t *psram_audio_buffers[NUM_BUFFERS];
+uint8_t video_buffer[VIDEO_BUFFER_SIZE];
+SemaphoreHandle_t xAudioSemaphore;
+SemaphoreHandle_t xVideoSemaphore;
+SemaphoreHandle_t xFileSystemSemaphore;
+int write_index_audio = 0;
+int read_index_audio = 2;
+int write_index_video = 0;
+int read_index_video = 2;
+static const char *TAG = "app_main";
+void init_storage() {
+   // Allocate buffers in PSRAM
+   for (int i = 0; i < NUM_BUFFERS; i++) {
+       psram_audio_buffers[i] = (uint8_t *)heap_caps_malloc(AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+       if (psram_audio_buffers[i] == NULL) {
+           ESP_LOGE(TAG, "Failed to allocate PSRAM buffer");
+       }
+   }
+   // Initialize SD card
+  esp_vfs_fat_mount_config_t mount_config = {
+       .format_if_mount_failed = true,
+       .max_files = 5,
+       .allocation_unit_size = 16 * 1024
+   };
+   sdmmc_card_t *card;
+   const char mount_point[] = "/sdcard";
+   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+   esp_err_t ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+   if (ret != ESP_OK) {
+       ESP_LOGE(TAG, "Failed to initialize the card (%s)", esp_err_to_name(ret));
+   } else {
+       ESP_LOGI(TAG, "SD card initialized successfully");
+   }
+}
+void init_i2s() {
+   i2s_config_t i2s_config = {
+       .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+       .sample_rate = 44100,
+       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+       .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+       .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+       .dma_buf_count = 8,
+       .dma_buf_len = 1024,
+       .use_apll = false,
+       .tx_desc_auto_clear = true,
+       .fixed_mclk = 0
+   };
+   i2s_pin_config_t pin_config = {
+       .bck_io_num = 26,
+       .ws_io_num = 25,
+       .data_out_num = I2S_PIN_NO_CHANGE,
+       .data_in_num = 35
+   };
+   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+   i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+void init_camera() {
+   camera_config_t config = {
+       .pin_pwdn = -1,
+       .pin_reset = -1,
+       .pin_xclk = 10,
+       .pin_sccb_sda = 8,
+       .pin_sccb_scl = 11,
+       .pin_d7 = 38,
+       .pin_d6 = 40,
+       .pin_d5 = 39,
+       .pin_d4 = 42,
+       .pin_d3 = 41,
+       .pin_d2 = 37,
+       .pin_d1 = 48,
+       .pin_d0 = 47,
+       .pin_vsync = 21,
+       .pin_href = 3,
+       .pin_pclk = 14,
+       .xclk_freq_hz = 20000000,
+       .ledc_timer = LEDC_TIMER_0,
+       .ledc_channel = LEDC_CHANNEL_0,
+       .pixel_format = PIXFORMAT_JPEG,
+       .frame_size = FRAMESIZE_QVGA,
+       .jpeg_quality = 12,
+       .fb_count = 2
+   };
+   esp_err_t err = esp_camera_init(&config);
+   if (err != ESP_OK) {
+       ESP_LOGE(TAG, "Camera Init Failed");
+   }
+}
+void init_wifi() {
+   // Initialize NVS
+   esp_err_t ret = nvs_flash_init();
+   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+       ESP_ERROR_CHECK(nvs_flash_erase());
+       ret = nvs_flash_init();
+   }
+   ESP_ERROR_CHECK(ret);
+   // Initialize the network interface
+   ESP_ERROR_CHECK(esp_netif_init());
+   // Create the default event loop
+   ESP_ERROR_CHECK(esp_event_loop_create_default());
+   // Create default Wi-Fi station
+   esp_netif_create_default_wifi_sta();
+   // Initialize the Wi-Fi stack in STA mode
+   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+   // Configure the Wi-Fi connection and start the interface
+   wifi_config_t wifi_config = {
+       .sta = {
+           .ssid = "your_ssid",
+           .password = "your_password"
+       },
+   };
+   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+   ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+   ESP_ERROR_CHECK(esp_wifi_start());
+}
+void capture_video_task(void *pvParameters) {
+   while (1) {
+       char file_name[30];
+       sprintf(file_name, "/sdcard/video_%d.jpg", write_index_video);
+       camera_fb_t *fb = esp_camera_fb_get();
+       if (fb) {
+           FILE* f = fopen(file_name, "w");
+           if (f != NULL) {
+               fwrite(fb->buf, 1, fb->len, f);
+               fclose(f);
+           }
+           esp_camera_fb_return(fb);
+       }
+       write_index_video = (write_index_video + 1) % NUM_BUFFERS;
+       vTaskDelay(pdMS_TO_TICKS(1000)); // Capture every second
+   }
+}
+void capture_audio_task(void *pvParameters) {
+   size_t bytes_read;
+   while (1) {
+       if (xSemaphoreTake(xAudioSemaphore, portMAX_DELAY) == pdTRUE) {
+           i2s_read(I2S_NUM_0, psram_audio_buffers[write_index_audio], AUDIO_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
+           write_index_audio = (write_index_audio + 1) % NUM_BUFFERS;
+           xSemaphoreGive(xAudioSemaphore);
+       }
+       vTaskDelay(pdMS_TO_TICKS(1000)); // Capture every second
+   }
+}
+void stream_video_task(void *pvParameters) {
+   while (1) {
+       if (xSemaphoreTake(xVideoSemaphore, portMAX_DELAY) == pdTRUE) {
+           char file_name[30];
+           sprintf(file_name, "/sdcard/video_%d.jpg", read_index_video);
+           FILE* f = fopen(file_name, "r");
+           if (f != NULL) {
+               fread(video_buffer, 1, VIDEO_BUFFER_SIZE, f);
+               fclose(f);
+               // Send video_buffer over Wi-Fi
+           }
+           read_index_video = (read_index_video + 1) % NUM_BUFFERS;
+           xSemaphoreGive(xVideoSemaphore);
+       }
+       vTaskDelay(pdMS_TO_TICKS(1000)); // Stream every second
+   }
+}
+void stream_audio_task(void *pvParameters) {
+   while (1) {
+       if (xSemaphoreTake(xAudioSemaphore, portMAX_DELAY) == pdTRUE) {
+           // Send audio data from PSRAM buffer over Wi-Fi
+           // Example: send_audio_over_wifi(psram_audio_buffers[read_index_audio], AUDIO_BUFFER_SIZE);
+           read_index_audio = (read_index_audio + 1) % NUM_BUFFERS;
+           xSemaphoreGive(xAudioSemaphore);
+       }
+       vTaskDelay(pdMS_TO_TICKS(1000)); // Stream every second
+   }
+}
+void ai_assistant_task(void *pvParameters) {
+   while (1) {
+       // AI assistant functionality
+       // Handle questions, play music, etc.
+       vTaskDelay(pdMS_TO_TICKS(1000)); // AI task interval
+   }
+}
+void file_system_task(void *pvParameters) {
+   while (1) {
+       if (xSemaphoreTake(xFileSystemSemaphore, portMAX_DELAY) == pdTRUE) {
+           // Calculate the file to be deleted (2 seconds behind read_index)
+           int delete_index_video = (read_index_video - 2 + NUM_BUFFERS) % NUM_BUFFERS;
+           char file_name_video[30];
+           sprintf(file_name_video, "/sdcard/video_%d.jpg", delete_index_video);
+           remove(file_name_video);
+           int delete_index_audio = (read_index_audio - 2 + NUM_BUFFERS) % NUM_BUFFERS;
+           // Free the PSRAM buffer and reallocate it
+           if (psram_audio_buffers[delete_index_audio]) {
+               free(psram_audio_buffers[delete_index_audio]);
+               psram_audio_buffers[delete_index_audio] = (uint8_t *)heap_caps_malloc(AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+               if (psram_audio_buffers[delete_index_audio] == NULL) {
+                   ESP_LOGE(TAG, "Failed to reallocate PSRAM buffer");
+               }
+           }
+           xSemaphoreGive(xFileSystemSemaphore);
+       }
+       vTaskDelay(pdMS_TO_TICKS(5000)); // File management interval
+   }
+}
+void app_main() {
+   // Initialize storage, peripherals, and Wi-Fi
+   init_storage();
+   init_i2s();
+   init_camera();
+   init_wifi();
+   // Create mutexes and semaphores
+   xAudioSemaphore = xSemaphoreCreateMutex();
+   xVideoSemaphore = xSemaphoreCreateMutex();
+   xFileSystemSemaphore = xSemaphoreCreateMutex();
+   // Create tasks
+   xTaskCreatePinnedToCore(capture_video_task, "capture_video_task", 4096, NULL, 5, NULL, 0);
+   xTaskCreatePinnedToCore(capture_audio_task, "capture_audio_task", 4096, NULL, 5, NULL, 0);
+   xTaskCreatePinnedToCore(file_system_task, "file_system_task", 4096, NULL, 5, NULL, 0);
+   xTaskCreatePinnedToCore(stream_video_task, "stream_video_task", 4096, NULL, 5, NULL, 1);
+   xTaskCreatePinnedToCore(stream_audio_task, "stream_audio_task", 4096, NULL, 5, NULL, 1);
+   xTaskCreatePinnedToCore(ai_assistant_task, "ai_assistant_task", 4096, NULL, 5, NULL, 1);
+}
+
+
